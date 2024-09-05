@@ -8,13 +8,19 @@
  * https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/data-api.html
  *
  * @author Jeremy Daly <jeremy@jeremydaly.com>
+ * @author Sam Hulick <samh@reelcrafter.com>
  * @version 1.2.0
  * @license MIT
  */
 
-// Require the aws-sdk. This is a dev dependency, so if being used
-// outside of a Lambda execution environment, it must be manually installed.
-const AWS = require('aws-sdk')
+const {
+  RDSDataClient,
+  ExecuteStatementCommand,
+  BatchExecuteStatementCommand,
+  BeginTransactionCommand,
+  CommitTransactionCommand,
+  RollbackTransactionCommand
+} = require('@aws-sdk/client-rds-data')
 
 // Require sqlstring to add additional escaping capabilities
 const sqlString = require('sqlstring')
@@ -46,7 +52,7 @@ const parseSQL = (args) =>
     ? args[0]
     : typeof args[0] === 'object' && typeof args[0].sql === 'string'
     ? args[0].sql
-    : error(`No 'sql' statement provided.`)
+    : error("No 'sql' statement provided.")
 
 // Parse the parameters from provided arguments
 const parseParams = (args) =>
@@ -59,7 +65,7 @@ const parseParams = (args) =>
     : typeof args[1] === 'object'
     ? [args[1]]
     : args[0].parameters
-    ? error(`'parameters' must be an object or array`)
+    ? error("'parameters' must be an object or array")
     : args[1]
     ? error('Parameters must be an object or array')
     : []
@@ -71,7 +77,7 @@ const parseDatabase = (config, args) =>
     : typeof args[0].database === 'string'
     ? args[0].database
     : args[0].database
-    ? error(`'database' must be a string.`)
+    ? error("'database' must be a string.")
     : config.database
     ? config.database
     : undefined // removed for #47 - error('No \'database\' provided.')
@@ -81,7 +87,7 @@ const parseHydrate = (config, args) =>
   typeof args[0].hydrateColumnNames === 'boolean'
     ? args[0].hydrateColumnNames
     : args[0].hydrateColumnNames
-    ? error(`'hydrateColumnNames' must be a boolean.`)
+    ? error("'hydrateColumnNames' must be a boolean.")
     : config.hydrateColumnNames
 
 // Parse the supplied format options, or default to config
@@ -92,23 +98,26 @@ const parseFormatOptions = (config, args) =>
           typeof args[0].formatOptions.deserializeDate === 'boolean'
             ? args[0].formatOptions.deserializeDate
             : args[0].formatOptions.deserializeDate
-            ? error(`'formatOptions.deserializeDate' must be a boolean.`)
+            ? error("'formatOptions.deserializeDate' must be a boolean.")
             : config.formatOptions.deserializeDate,
         treatAsLocalDate:
-          typeof args[0].formatOptions.treatAsLocalDate == 'boolean'
+          typeof args[0].formatOptions.treatAsLocalDate === 'boolean'
             ? args[0].formatOptions.treatAsLocalDate
             : args[0].formatOptions.treatAsLocalDate
-            ? error(`'formatOptions.treatAsLocalDate' must be a boolean.`)
+            ? error("'formatOptions.treatAsLocalDate' must be a boolean.")
             : config.formatOptions.treatAsLocalDate
       }
     : args[0].formatOptions
-    ? error(`'formatOptions' must be an object.`)
+    ? error("'formatOptions' must be an object.")
     : config.formatOptions
 
 // Prepare method params w/ supplied inputs if an object is passed
 const prepareParams = ({ secretArn, resourceArn }, args) => {
   return Object.assign(
-    { secretArn, resourceArn }, // return Arns
+    {
+      secretArn,
+      resourceArn
+    },
     typeof args[0] === 'object' ? omit(args[0], ['hydrateColumnNames', 'parameters']) : {} // merge any inputs
   )
 }
@@ -160,9 +169,8 @@ const processParams = (engine, sql, sqlParams, params, formatOptions, row = 0) =
           sql = sql.replace(regex, sqlString.escapeId(p.value))
         }
         return acc
-      } else {
-        return acc
       }
+      return acc
     }, []),
     escapedSql: sql
   }
@@ -247,7 +255,7 @@ const formatType = (name, value, type, typeHint, formatOptions) => {
 // Formats the (UTC) date to the AWS accepted YYYY-MM-DD HH:MM:SS[.FFF] format
 // See https://docs.aws.amazon.com/rdsdataservice/latest/APIReference/API_SqlParameter.html
 const formatToTimeStamp = (date, treatAsLocalDate) => {
-  const pad = (val, num = 2) => '0'.repeat(num - (val + '').length) + val
+  const pad = (val, num = 2) => '0'.repeat(num - String(val).length) + val
 
   const year = treatAsLocalDate ? date.getFullYear() : date.getUTCFullYear()
   const month = (treatAsLocalDate ? date.getMonth() : date.getUTCMonth()) + 1 // Convert to human month
@@ -267,7 +275,7 @@ const formatToTimeStamp = (date, treatAsLocalDate) => {
 // If standard TIMESTAMP format (YYYY-MM-DD[ HH:MM:SS[.FFF]]) without TZ + treatAsLocalDate=false then assume UTC Date
 // In all other cases convert value to datetime as-is (also values with TZ info)
 const formatFromTimeStamp = (value, treatAsLocalDate) =>
-  !treatAsLocalDate && /^\d{4}-\d{2}-\d{2}(\s\d{2}:\d{2}:\d{2}(\.\d+)?)?$/.test(value)
+  !treatAsLocalDate && /^\d{4}-\d{2}-\d{2}(\s\d{2}:\d{2}:\d{2}(\.\d{3})?)?$/.test(value)
     ? new Date(value + 'Z')
     : new Date(value)
 
@@ -301,7 +309,7 @@ const formatResults = (
 // object with named column labels
 const formatRecords = (recs, columns, hydrate, formatOptions) => {
   // Create map for efficient value parsing
-  let fmap =
+  const fmap =
     recs && recs[0]
       ? recs[0].map((x, i) => {
           return Object.assign({}, columns ? { label: columns[i].label, typeName: columns[i].typeName } : {}) // add column label and typeName
@@ -328,20 +336,19 @@ const formatRecords = (recs, columns, hydrate, formatOptions) => {
                 : acc.concat(value)
 
               // Else discover the field type
-            } else {
-              // Look for non-null fields
-              Object.keys(field).map((type) => {
-                if (type !== 'isNull' && field[type] !== null) {
-                  fmap[i]['field'] = type
-                }
-              })
-
-              // Return the mapped field (this should NEVER be null)
-              const value = formatRecordValue(field[fmap[i].field], fmap[i].typeName, formatOptions)
-              return hydrate // object if hydrate, else array
-                ? Object.assign(acc, { [fmap[i].label]: value })
-                : acc.concat(value)
             }
+            // Look for non-null fields
+            Object.keys(field).forEach((type) => {
+              if (type !== 'isNull' && field[type] !== null) {
+                fmap[i].field = type
+              }
+            })
+
+            // Return the mapped field (this should NEVER be null)
+            const value = formatRecordValue(field[fmap[i].field], fmap[i].typeName, formatOptions)
+            return hydrate // object if hydrate, else array
+              ? Object.assign(acc, { [fmap[i].label]: value })
+              : acc.concat(value)
           },
           hydrate ? {} : []
         ) // init object if hydrate, else init array
@@ -350,22 +357,17 @@ const formatRecords = (recs, columns, hydrate, formatOptions) => {
 } // end formatRecords
 
 // Format record value based on its value, the database column's typeName and the formatting options
-const formatRecordValue = (value, typeName, formatOptions) => {
-  if (
-    formatOptions &&
-    formatOptions.deserializeDate &&
-    ['DATE', 'DATETIME', 'TIMESTAMP', 'TIMESTAMPTZ', 'TIMESTAMP WITH TIME ZONE'].includes(typeName.toUpperCase())
-  ) {
-    return formatFromTimeStamp(
-      value,
-      (formatOptions && formatOptions.treatAsLocalDate) || typeName === 'TIMESTAMP WITH TIME ZONE'
-    )
-  } else if (typeName === 'JSON') {
-    return JSON.parse(value)
-  } else {
-    return value
-  }
-}
+const formatRecordValue = (value, typeName, formatOptions) =>
+  formatOptions &&
+  formatOptions.deserializeDate &&
+  ['DATE', 'DATETIME', 'TIMESTAMP', 'TIMESTAMP WITH TIME ZONE'].includes(typeName)
+    ? formatFromTimeStamp(
+        value,
+        (formatOptions && formatOptions.treatAsLocalDate) || typeName === 'TIMESTAMP WITH TIME ZONE'
+      )
+    : typeName === 'JSON'
+    ? JSON.parse(value)
+    : value
 
 // Format updateResults and extract insertIds
 const formatUpdateResults = (res) =>
@@ -426,17 +428,17 @@ const query = async function (config, ..._args) {
     // attempt to run the query
 
     // Capture the result for debugging
-    let result = await (isBatch
-      ? config.RDS.batchExecuteStatement(params).promise()
-      : config.RDS.executeStatement(params).promise())
+    const result = await (isBatch
+      ? config.RDS.send(new BatchExecuteStatementCommand(params))
+      : config.RDS.send(new ExecuteStatementCommand(params)))
 
     // Format and return the results
     return formatResults(result, hydrateColumnNames, args[0].includeResultMetadata === true, formatOptions)
   } catch (e) {
     if (this && this.rollback) {
-      let rollback = await config.RDS.rollbackTransaction(
-        pick(params, ['resourceArn', 'secretArn', 'transactionId'])
-      ).promise()
+      const rollback = await config.RDS.send(
+        new RollbackTransactionCommand(pick(params, ['resourceArn', 'secretArn', 'transactionId']))
+      )
 
       this.rollback(e, rollback)
     }
@@ -451,8 +453,9 @@ const query = async function (config, ..._args) {
 
 // Init a transaction object and return methods
 const transaction = (config, _args) => {
-  let args = typeof _args === 'object' ? [_args] : [{}]
-  let queries = [] // keep track of queries
+  const args = typeof _args === 'object' ? [_args] : [{}]
+  const queries = [] // keep track of queries
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
   let rollback = () => {} // default rollback event
 
   const txConfig = Object.assign(prepareParams(config, args), {
@@ -463,7 +466,7 @@ const transaction = (config, _args) => {
   })
 
   return {
-    query: function (...args) {
+    query(...args) {
       if (typeof args[0] === 'function') {
         queries.push(args[0])
       } else {
@@ -471,42 +474,42 @@ const transaction = (config, _args) => {
       }
       return this
     },
-    rollback: function (fn) {
+    rollback(fn) {
       if (typeof fn === 'function') {
         rollback = fn
       }
       return this
     },
-    commit: async function () {
-      return await commit(txConfig, queries, rollback)
+    async commit() {
+      return commit(txConfig, queries, rollback)
     }
   }
 }
 
 // Commit transaction by running queries
 const commit = async (config, queries, rollback) => {
-  let results = [] // keep track of results
+  const results = [] // keep track of results
 
   // Start a transaction
-  const { transactionId } = await config.RDS.beginTransaction(
-    pick(config, ['resourceArn', 'secretArn', 'database'])
-  ).promise()
+  const { transactionId } = await config.RDS.send(
+    new BeginTransactionCommand(pick(config, ['resourceArn', 'secretArn', 'database']))
+  )
 
   // Add transactionId to the config
-  let txConfig = Object.assign(config, { transactionId })
+  const txConfig = Object.assign(config, { transactionId })
 
   // Loop through queries
   for (let i = 0; i < queries.length; i++) {
     // Execute the queries, pass the rollback as context
-    let result = await query.apply({ rollback }, [config, queries[i](results[results.length - 1], results)])
+    const result = await query.apply({ rollback }, [config, queries[i](results[results.length - 1], results)])
     // Add the result to the main results accumulator
     results.push(result)
   }
 
   // Commit our transaction
-  const { transactionStatus } = await txConfig.RDS.commitTransaction(
-    pick(config, ['resourceArn', 'secretArn', 'transactionId'])
-  ).promise()
+  const { transactionStatus } = await txConfig.RDS.send(
+    new CommitTransactionCommand(pick(config, ['resourceArn', 'secretArn', 'transactionId']))
+  )
 
   // Add the transaction status to the results
   results.push({ transactionStatus })
@@ -546,7 +549,7 @@ const init = (params) => {
     typeof params.options === 'object'
       ? params.options
       : params.options !== undefined
-      ? error(`'options' must be an object`)
+      ? error("'options' must be an object")
       : {}
 
   // Update the AWS http agent with the region
@@ -565,18 +568,18 @@ const init = (params) => {
     engine: typeof params.engine === 'string' ? params.engine : 'mysql',
 
     // Require secretArn
-    secretArn: typeof params.secretArn === 'string' ? params.secretArn : error(`'secretArn' string value required`),
+    secretArn: typeof params.secretArn === 'string' ? params.secretArn : error("'secretArn' string value required"),
 
     // Require resourceArn
     resourceArn:
-      typeof params.resourceArn === 'string' ? params.resourceArn : error(`'resourceArn' string value required`),
+      typeof params.resourceArn === 'string' ? params.resourceArn : error("'resourceArn' string value required"),
 
     // Load optional database
     database:
       typeof params.database === 'string'
         ? params.database
         : params.database !== undefined
-        ? error(`'database' must be a string`)
+        ? error("'database' must be a string")
         : undefined,
 
     // Load optional schema DISABLED for now since this isn't used with MySQL
@@ -594,9 +597,8 @@ const init = (params) => {
       treatAsLocalDate: typeof params.formatOptions === 'object' && params.formatOptions.treatAsLocalDate
     },
 
-    // TODO: Put this in a separate module for testing?
     // Create an instance of RDSDataService
-    RDS: params.AWS ? new params.AWS.RDSDataService(options) : new AWS.RDSDataService(options)
+    RDS: new RDSDataClient(options)
   } // end config
 
   // Return public methods
@@ -605,20 +607,22 @@ const init = (params) => {
     query: (...x) => query(config, ...x),
     // Transaction method, pass config and parameters
     transaction: (x) => transaction(config, x),
-
-    // Export promisified versions of the RDSDataService methods
     batchExecuteStatement: (args) =>
-      config.RDS.batchExecuteStatement(
-        mergeConfig(pick(config, ['resourceArn', 'secretArn', 'database']), args)
-      ).promise(),
+      config.RDS.send(
+        new BatchExecuteStatementCommand(mergeConfig(pick(config, ['resourceArn', 'secretArn', 'database']), args))
+      ),
     beginTransaction: (args) =>
-      config.RDS.beginTransaction(mergeConfig(pick(config, ['resourceArn', 'secretArn', 'database']), args)).promise(),
+      config.RDS.send(
+        new BeginTransactionCommand(mergeConfig(pick(config, ['resourceArn', 'secretArn', 'database']), args))
+      ),
     commitTransaction: (args) =>
-      config.RDS.commitTransaction(mergeConfig(pick(config, ['resourceArn', 'secretArn']), args)).promise(),
+      config.RDS.send(new CommitTransactionCommand(mergeConfig(pick(config, ['resourceArn', 'secretArn']), args))),
     executeStatement: (args) =>
-      config.RDS.executeStatement(mergeConfig(pick(config, ['resourceArn', 'secretArn', 'database']), args)).promise(),
+      config.RDS.send(
+        new ExecuteStatementCommand(mergeConfig(pick(config, ['resourceArn', 'secretArn', 'database']), args))
+      ),
     rollbackTransaction: (args) =>
-      config.RDS.rollbackTransaction(mergeConfig(pick(config, ['resourceArn', 'secretArn']), args)).promise()
+      config.RDS.send(new RollbackTransactionCommand(mergeConfig(pick(config, ['resourceArn', 'secretArn']), args)))
   }
 } // end exports
 
